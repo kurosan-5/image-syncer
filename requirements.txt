@@ -1,0 +1,6 @@
+Flask==2.3.3
+Flask-CORS==4.0.0
+Pillow==10.0.1
+python-magic==0.4.27
+pillow-heif==0.13.0
+python-dotenv==1.0.0
