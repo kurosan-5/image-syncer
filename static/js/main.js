@@ -8,6 +8,12 @@ class PhotoApp {
         this.currentViewerIndex = 0;
         this.isViewerUIVisible = true;
         
+        // ページネーション用変数
+        this.currentPage = 1;
+        this.hasNextPage = true;
+        this.isLoading = false;
+        this.perPage = 50;
+        
         // DOM要素
         this.uploadSection = document.getElementById('uploadSection');
         this.photoGrid = document.getElementById('photoGrid');
@@ -117,7 +123,8 @@ class PhotoApp {
         // キーボードイベント
         document.addEventListener('keydown', (e) => this.handleKeydown(e));
         
-        // ハプティックフィードバック（iOS Safari対応）
+        // 無限スクロールの設定
+        this.setupInfiniteScroll();
         this.setupHapticFeedback();
     }
     
@@ -316,12 +323,19 @@ class PhotoApp {
         }
     }
     
-    // ファイル一覧の読み込み
-    async loadFiles() {
+    // ファイル一覧の読み込み（ページネーション対応）
+    async loadFiles(page = 1, append = false) {
+        if (this.isLoading) return;
+        
         try {
+            this.isLoading = true;
+            if (!append) {
+                this.showLoading(true);
+            }
+            
             // キャッシュを無効にするためにタイムスタンプを追加
             const timestamp = new Date().getTime();
-            const response = await fetch(`/files?_t=${timestamp}`, {
+            const response = await fetch(`/files?page=${page}&per_page=${this.perPage}&_t=${timestamp}`, {
                 cache: 'no-cache',
                 headers: {
                     'Cache-Control': 'no-cache',
@@ -329,19 +343,38 @@ class PhotoApp {
                 }
             });
             const data = await response.json();
-            console.log('Loaded files from server:', data.files.map(f => f.id));
-            this.files = data.files;
-            this.renderPhotoGrid();
+            
+            console.log(`Loaded page ${page}:`, data.files.length, 'files');
+            
+            if (append) {
+                // 既存のファイルに追加
+                this.files = [...this.files, ...data.files];
+            } else {
+                // 新規読み込み
+                this.files = data.files;
+                this.currentPage = 1;
+            }
+            
+            // ページネーション情報を更新
+            this.hasNextPage = data.pagination?.has_next || false;
+            this.currentPage = page;
+            
+            this.renderPhotoGrid(append);
         } catch (error) {
             console.error('Failed to load files:', error);
             this.showError('ファイルの読み込みに失敗しました');
+        } finally {
+            this.isLoading = false;
+            if (!append) {
+                this.showLoading(false);
+            }
         }
     }
     
-    // 写真グリッドの描画
-    renderPhotoGrid() {
+    // 写真グリッドの描画（無限スクロール対応）
+    renderPhotoGrid(append = false) {
         console.log('=== RENDER PHOTO GRID ===');
-        console.log('Files to render:', this.files.map(f => ({ id: f.id, name: f.original_name, type: f.file_type })));
+        console.log('Files to render:', this.files.length, append ? '(appending)' : '(new)');
         
         if (this.files.length === 0) {
             this.uploadSection.style.display = 'flex';
@@ -352,40 +385,140 @@ class PhotoApp {
         this.uploadSection.style.display = 'none';
         this.photoGrid.style.display = 'grid';
         
-        this.photoGrid.innerHTML = this.files.map((file, index) => {
-            const isSelected = this.selectedFiles.has(file.id);
-            const isVideo = file.file_type === 'video';
-            
-            console.log(`Creating HTML for file ${file.id} (${file.file_type})`);
-            
-            return `
-                <div class="photo-item ${isSelected ? 'selected' : ''}" 
-                     data-file-id="${file.id}" 
-                     data-index="${index}">
-                    ${isVideo ? 
-                        `<video muted playsinline preload="metadata" poster="/thumbnails/${file.id}">
-                            <source src="/files/${file.id}" type="${file.mime_type || 'video/mp4'}">
-                        </video>
-                        <div class="video-overlay">
-                            <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
-                                <polygon points="5,3 19,12 5,21"/>
-                            </svg>
-                            動画
-                        </div>` :
-                        `<img src="/thumbnails/${file.id}" 
-                              alt="${file.original_name}"
-                              loading="lazy"
-                              onerror="console.error('Failed to load thumbnail for ${file.id}'); this.style.display='none'; this.parentElement.innerHTML='<div style=\\'display:flex;align-items:center;justify-content:center;height:100%;background:#f0f0f0;color:#666;\\'>画像を読み込めません</div>'">`
-                    }
-                    <div class="selection-indicator"></div>
-                </div>
-            `;
-        }).join('');
+        if (!append) {
+            // 新規描画の場合は全てクリア
+            this.photoGrid.innerHTML = '';
+        }
         
-        // イベントリスナーを追加
-        this.photoGrid.querySelectorAll('.photo-item').forEach(item => {
-            item.addEventListener('click', (e) => this.handlePhotoClick(e));
+        // 新しいファイルのみを描画
+        const startIndex = append ? this.photoGrid.children.length : 0;
+        const filesToRender = this.files.slice(startIndex);
+        
+        filesToRender.forEach((file, index) => {
+            const realIndex = startIndex + index;
+            const photoItem = this.createPhotoItem(file, realIndex);
+            this.photoGrid.appendChild(photoItem);
         });
+        
+        // 遅延読み込みを適用
+        this.setupLazyLoading();
+    }
+    
+    // 写真アイテムを作成
+    createPhotoItem(file, index) {
+        const isSelected = this.selectedFiles.has(file.id);
+        const isVideo = file.file_type === 'video';
+        
+        console.log(`Creating element for file ${file.id} (${file.file_type})`);
+        
+        const photoItem = document.createElement('div');
+        photoItem.className = `photo-item ${isSelected ? 'selected' : ''}`;
+        photoItem.setAttribute('data-file-id', file.id);
+        photoItem.setAttribute('data-index', index);
+        
+        photoItem.innerHTML = `
+            ${isVideo ? 
+                `<img data-src="/thumbnails/${file.id}" 
+                      alt="${file.original_name}"
+                      loading="lazy"
+                      onerror="this.src='/static/icon-192.png'">
+                <div class="video-overlay">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+                        <polygon points="5,3 19,12 5,21"/>
+                    </svg>
+                    動画
+                </div>` :
+                `<img data-src="/thumbnails/${file.id}" 
+                      alt="${file.original_name}"
+                      loading="lazy"
+                      onerror="this.src='/static/icon-192.png'">`
+            }
+            ${this.isSelectionMode ? 
+                `<div class="selection-overlay">
+                    <div class="selection-circle ${isSelected ? 'selected' : ''}">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polyline points="20,6 9,17 4,12"></polyline>
+                        </svg>
+                    </div>
+                </div>` : 
+                ''
+            }
+        `;
+        
+        // クリックイベント
+        photoItem.addEventListener('click', () => {
+            if (this.isSelectionMode) {
+                this.toggleFileSelection(file.id);
+            } else {
+                this.openViewer(index);
+            }
+        });
+        
+        return photoItem;
+    }
+    
+    // 無限スクロールの設定
+    setupInfiniteScroll() {
+        let timeoutId;
+        window.addEventListener('scroll', () => {
+            if (timeoutId) clearTimeout(timeoutId);
+            timeoutId = setTimeout(() => {
+                if (!this.isLoading && this.hasNextPage) {
+                    const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+                    const windowHeight = window.innerHeight;
+                    const documentHeight = document.documentElement.scrollHeight;
+                    
+                    // 画面の下から200px以内に来たら次のページを読み込み
+                    if (scrollTop + windowHeight >= documentHeight - 200) {
+                        this.loadFiles(this.currentPage + 1, true);
+                    }
+                }
+            }, 100);
+        });
+    }
+    
+    // 遅延読み込みの設定
+    setupLazyLoading() {
+        if ('IntersectionObserver' in window) {
+            const imageObserver = new IntersectionObserver((entries, observer) => {
+                entries.forEach(entry => {
+                    if (entry.isIntersecting) {
+                        const img = entry.target;
+                        if (img.dataset.src) {
+                            img.src = img.dataset.src;
+                            img.removeAttribute('data-src');
+                        }
+                        observer.unobserve(img);
+                    }
+                });
+            });
+            
+            // 新しく追加された画像に対して遅延読み込みを適用
+            document.querySelectorAll('img[data-src], video[data-src]').forEach(img => {
+                imageObserver.observe(img);
+            });
+        } else {
+            // Intersection Observer がサポートされていない場合は即座に読み込み
+            document.querySelectorAll('img[data-src], video[data-src]').forEach(img => {
+                if (img.dataset.src) {
+                    img.src = img.dataset.src;
+                    img.removeAttribute('data-src');
+                }
+            });
+        }
+    }
+    
+    // ファイル選択の切り替え
+    toggleFileSelection(fileId) {
+        const photoItem = document.querySelector(`[data-file-id="${fileId}"]`);
+        if (this.selectedFiles.has(fileId)) {
+            this.selectedFiles.delete(fileId);
+            photoItem.classList.remove('selected');
+        } else {
+            this.selectedFiles.add(fileId);
+            photoItem.classList.add('selected');
+        }
+        this.updateSelectionUI();
     }
     
     // 写真クリック処理
@@ -476,12 +609,47 @@ class PhotoApp {
     
     // ビューアコンテンツを更新
     updateViewerContent(file) {
-        this.viewerContent.innerHTML = file.file_type === 'video' ?
-            `<video controls autoplay muted playsinline preload="metadata">
-                <source src="/files/${file.id}" type="${file.mime_type || 'video/mp4'}">
-                <p>お使いのブラウザは動画再生をサポートしていません。</p>
-            </video>` :
-            `<img src="/files/${file.id}" alt="${file.original_name}" loading="eager">`;
+        if (file.file_type === 'video') {
+            // Live Photosや短い動画の場合はループ再生を有効化
+            const isShortVideo = file.original_name.includes('IMG_E') || 
+                                file.original_name.includes('Live') ||
+                                file.mime_type === 'video/quicktime';
+            
+            this.viewerContent.innerHTML = `
+                <video controls muted playsinline preload="metadata" 
+                       ${isShortVideo ? 'loop' : ''} 
+                       style="max-width: 100%; max-height: 100%;">
+                    <source src="/files/${file.id}" type="${file.mime_type || 'video/mp4'}">
+                    <source src="/files/${file.id}" type="video/mp4">
+                    <p>お使いのブラウザは動画再生をサポートしていません。</p>
+                </video>`;
+            
+            // 動画要素を取得してイベントリスナーを追加
+            const video = this.viewerContent.querySelector('video');
+            if (video) {
+                video.addEventListener('loadedmetadata', () => {
+                    console.log('Video loaded:', file.original_name, 'Duration:', video.duration);
+                    
+                    // Live Photosの場合は自動再生を試行
+                    if (isShortVideo && video.duration <= 3) {
+                        video.play().catch(e => {
+                            console.log('Video autoplay blocked:', e);
+                        });
+                    }
+                });
+                
+                video.addEventListener('error', (e) => {
+                    console.error('Video error:', e, file.original_name);
+                    console.error('Error details:', video.error);
+                });
+                
+                video.addEventListener('canplay', () => {
+                    console.log('Video can play:', file.original_name);
+                });
+            }
+        } else {
+            this.viewerContent.innerHTML = `<img src="/files/${file.id}" alt="${file.original_name}" loading="eager">`;
+        }
     }
     
     // ビューアUI表示切り替え
@@ -682,7 +850,12 @@ class PhotoApp {
                 }
             });
             
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+            
             const result = await response.json();
+            console.log('Scan result:', result); // デバッグ用
             
             if (result.success) {
                 // 成功メッセージ表示
@@ -690,9 +863,9 @@ class PhotoApp {
                 this.showToast(message, 'success');
                 
                 // ギャラリーを再読み込み
-                await this.loadGallery();
+                await this.loadFiles();
             } else {
-                this.showToast('スキャンに失敗しました', 'error');
+                this.showToast(result.error || 'スキャンに失敗しました', 'error');
             }
         } catch (error) {
             console.error('Scan error:', error);

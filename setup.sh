@@ -15,6 +15,15 @@ fi
 
 echo "✅ Python3が見つかりました: $(python3 --version)"
 
+
+# 仮想環境の作成
+echo "🔧 Python仮想環境を作成中..."
+python3 -m venv .venv
+
+# 仮想環境の有効化
+echo "🔧 仮想環境を有効化中..."
+source .venv/bin/activate
+
 # FFmpegのチェック
 if ! command -v ffmpeg &> /dev/null; then
     echo "⚠️  FFmpegがインストールされていません"
@@ -29,14 +38,6 @@ if ! command -v ffmpeg &> /dev/null; then
 else
     echo "✅ FFmpegが見つかりました: $(ffmpeg -version 2>&1 | head -n1)"
 fi
-
-# 仮想環境の作成
-echo "🔧 Python仮想環境を作成中..."
-python3 -m venv .venv
-
-# 仮想環境の有効化
-echo "🔧 仮想環境を有効化中..."
-source .venv/bin/activate
 
 # 依存関係のインストール
 echo "📦 依存関係をインストール中..."

@@ -86,10 +86,17 @@ body {
 .nav-left, .nav-right {
     flex: 1;
     display: flex;
+    align-items: center;
 }
 
 .nav-right {
     justify-content: flex-end;
+}
+
+.nav-right #normalActions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
 }
 
 .nav-center {
@@ -116,6 +123,8 @@ body {
     display: flex;
     align-items: center;
     gap: 4px;
+    min-height: 28px;
+    justify-content: center;
 }
 
 .nav-btn:hover {
@@ -138,11 +147,13 @@ body {
 /* 選択時のアクションボタン */
 .selection-actions {
     display: none;
+    align-items: center;
     gap: 8px;
 }
 
 .selection-actions.visible {
     display: flex;
+    align-items: center;
 }
 
 .nav-btn-danger {
@@ -152,6 +163,38 @@ body {
 
 .nav-btn-danger:hover {
     background-color: color-mix(in srgb, var(--danger-color) 90%, black);
+}
+
+/* 選択時のボタンサイズ調整 */
+.selection-actions .nav-btn {
+    padding: 6px 10px;
+    min-width: 40px;
+}
+
+.selection-actions .nav-btn svg {
+    width: 16px;
+    height: 16px;
+}
+
+/* 小さい画面での調整 */
+@media (max-width: 375px) {
+    .nav-right #normalActions {
+        gap: 4px;
+    }
+    
+    .selection-actions {
+        gap: 4px;
+    }
+    
+    .nav-btn {
+        padding: 6px 8px;
+        font-size: 16px;
+    }
+    
+    .selection-actions .nav-btn {
+        padding: 4px 8px;
+        min-width: 36px;
+    }
 }
 
 /* ===================

@@ -133,6 +133,61 @@ def get_image_taken_date(file_path):
     except:
         return datetime.now()
 
+def get_video_taken_date(file_path):
+    """動画の撮影日時を取得（メタデータから）"""
+    try:
+        import ffmpeg
+        
+        # ffprobeを使って動画のメタデータを取得
+        probe = ffmpeg.probe(file_path)
+        
+        # 作成日時を探す
+        format_info = probe.get('format', {})
+        tags = format_info.get('tags', {})
+        
+        # 様々なメタデータキーを試す
+        date_keys = ['creation_time', 'date', 'com.apple.quicktime.creationdate']
+        
+        for key in date_keys:
+            if key in tags:
+                date_str = tags[key]
+                try:
+                    # ISO 8601形式をパース
+                    if 'T' in date_str:
+                        # 2023-11-01T12:34:56.000000Z のような形式
+                        date_str = date_str.split('.')[0]  # ミリ秒部分を削除
+                        date_str = date_str.replace('Z', '')  # タイムゾーン情報を削除
+                        return datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%S")
+                    else:
+                        # その他の形式を試す
+                        return datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+    
+    except Exception as e:
+        print(f"動画メタデータ取得エラー: {e}")
+    
+    # メタデータから取得できない場合はファイルの作成日時を使用
+    try:
+        stat = Path(file_path).stat()
+        return datetime.fromtimestamp(stat.st_mtime)
+    except:
+        return datetime.now()
+
+def get_file_taken_date(file_path, file_type):
+    """ファイルタイプに応じて撮影日時を取得"""
+    if file_type == 'image':
+        return get_image_taken_date(file_path)
+    elif file_type == 'video':
+        return get_video_taken_date(file_path)
+    else:
+        # デフォルトはファイルの更新日時
+        try:
+            stat = Path(file_path).stat()
+            return datetime.fromtimestamp(stat.st_mtime)
+        except:
+            return datetime.now()
+
 def get_date_folder_name(taken_date):
     """撮影日時からフォルダ名を生成（YYYYMM形式）"""
     return taken_date.strftime("%Y%m")
@@ -144,9 +199,18 @@ def ensure_date_folder(taken_date):
     folder_path.mkdir(exist_ok=True)
     return folder_path, folder_name
 
-def scan_external_storage():
-    """外部ストレージの既存ファイルをスキャンしてデータベースに登録"""
+def scan_external_storage(force_rescan=False, max_files=None):
+    """外部ストレージの既存ファイルをスキャンしてデータベースに登録
+    
+    Args:
+        force_rescan (bool): Trueの場合、既存のファイルも再処理する
+        max_files (int): 処理するファイルの最大数（テスト用）
+    """
     print(f"[SCAN] 外部ストレージをスキャン中: {EXTERNAL_STORAGE_DIR}")
+    if force_rescan:
+        print("[SCAN] 強制再スキャンモード: 既存ファイルも再処理します")
+    if max_files:
+        print(f"[SCAN] テストモード: 最大{max_files}ファイルまで処理します")
     
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
@@ -163,13 +227,21 @@ def scan_external_storage():
         if not folder_path.is_dir():
             continue
             
-        # 日付フォルダかチェック（YYYYMM形式）
+        # 日付フォルダかチェック（YYYYMM形式 または YYYYMM__ や YYYYMM_a などの形式）
         folder_name = folder_path.name
-        if not (len(folder_name) == 6 and folder_name.isdigit()):
+        # thumbnailsフォルダは除外
+        if folder_name == 'thumbnails':
+            continue
+        # 最初の6文字が数字であればスキャン対象とする
+        if not (len(folder_name) >= 6 and folder_name[:6].isdigit()):
             continue
             
         print(f"[SCAN] フォルダをスキャン中: {folder_name}")
         
+        # 最大ファイル数チェック（フォルダレベルでも）
+        if max_files and added_count >= max_files:
+            print(f"[SCAN] テスト制限に達しました: {max_files}ファイル処理完了")
+            break
         # フォルダ内のファイルをスキャン
         for file_path in folder_path.rglob('*'):
             if not file_path.is_file():
@@ -188,10 +260,28 @@ def scan_external_storage():
                 print(f"[ERROR] ハッシュ計算エラー: {file_path}, {e}")
                 continue
             
-            # 既にデータベースに存在するかチェック
-            cursor.execute("SELECT id FROM files WHERE file_hash = ?", (file_hash,))
-            if cursor.fetchone():
-                continue  # 既に存在する
+            # 既にデータベースに存在するかチェック（強制再スキャンでない場合のみ）
+            if not force_rescan:
+                # HEICファイルの場合は変換後のJPEGファイルもチェック
+                check_paths = [str(file_path)]
+                if file_ext.lower() in {'.heic', '.heif'}:
+                    jpeg_path = file_path.parent / (file_path.stem + '.jpg')
+                    check_paths.append(str(jpeg_path))
+                
+                # ハッシュまたはファイルパスで既存チェック
+                for check_path in check_paths:
+                    cursor.execute("SELECT id FROM files WHERE file_hash = ? OR file_path = ?", (file_hash, check_path))
+                    existing_file = cursor.fetchone()
+                    if existing_file:
+                        break
+                
+                if existing_file:
+                    continue  # 既に存在する
+            
+            # 最大ファイル数チェック（テスト用）
+            if max_files and added_count >= max_files:
+                print(f"[SCAN] テスト制限に達しました: {max_files}ファイル処理完了")
+                break
             
             # ファイル情報を取得
             try:
@@ -199,11 +289,44 @@ def scan_external_storage():
                 file_type = 'image' if file_ext in image_extensions else 'video'
                 mime_type = mimetypes.guess_type(str(file_path))[0]
                 
-                # 撮影日時を取得
-                taken_date = get_image_taken_date(str(file_path))
+                # 撮影日時を取得（ファイルタイプに応じて適切な関数を使用）
+                try:
+                    taken_date = get_file_taken_date(str(file_path), file_type)
+                except Exception as e:
+                    print(f"[WARNING] 日時取得エラー（ファイル更新日時を使用）: {file_path}, {e}")
+                    # EXIF取得に失敗してもファイルの更新日時をフォールバックとして使用
+                    try:
+                        stat = file_path.stat()
+                        taken_date = datetime.fromtimestamp(stat.st_mtime)
+                    except:
+                        taken_date = datetime.now()
                 
                 # 相対パスを計算
                 relative_path = str(file_path.relative_to(EXTERNAL_STORAGE_DIR))
+                
+                # HEICファイルの場合はJPEGに変換
+                final_file_path = file_path
+                final_filename = file_path.name
+                final_mime_type = mime_type
+                
+                if file_ext.lower() in {'.heic', '.heif'}:
+                    print(f"[SCAN] HEIC変換中: {file_path.name}")
+                    # 変換後のファイルパス（同じディレクトリにJPEG版を作成）
+                    jpeg_filename = file_path.stem + '.jpg'
+                    jpeg_path = file_path.parent / jpeg_filename
+                    
+                    # HEIC -> JPEG変換実行
+                    if convert_heic_to_jpeg(str(file_path), str(jpeg_path)):
+                        final_file_path = jpeg_path
+                        final_filename = jpeg_filename
+                        final_mime_type = 'image/jpeg'
+                        # 変換後のファイルサイズを取得
+                        file_size = jpeg_path.stat().st_size
+                        # 新しいハッシュを計算
+                        file_hash = get_file_hash(str(jpeg_path))
+                        print(f"[SCAN] HEIC変換完了: {jpeg_filename}")
+                    else:
+                        print(f"[SCAN] HEIC変換失敗、元ファイルを使用: {file_path.name}")
                 
                 # データベースに追加
                 file_id = str(uuid.uuid4())
@@ -213,9 +336,46 @@ def scan_external_storage():
                         date_folder, file_type, mime_type, file_size, file_hash, taken_date
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    file_id, file_path.name, file_path.name, str(file_path),
-                    relative_path, folder_name, file_type, mime_type, file_size, file_hash, taken_date
+                    file_id, file_path.name, final_filename, str(final_file_path),
+                    relative_path, folder_name, file_type, final_mime_type, file_size, file_hash, taken_date
                 ))
+                
+                # サムネイル作成（動画のみ）
+                if file_type == 'video':
+                    # Live Photos動画の場合は互換形式に変換
+                    if is_live_photo_video(str(final_file_path)):
+                        print(f"[SCAN] Live Photos動画を検出: {final_filename}")
+                        
+                        # MP4に変換したファイルパス
+                        converted_path = final_file_path.with_suffix('.mp4')
+                        
+                        if convert_live_photo_video(str(final_file_path), str(converted_path)):
+                            # 変換成功時は元ファイルを削除し、データベースパスを更新
+                            import os
+                            os.remove(str(final_file_path))
+                            final_file_path = converted_path
+                            relative_path = str(final_file_path.relative_to(EXTERNAL_STORAGE_DIR))
+                            final_mime_type = 'video/mp4'
+                            
+                            # データベースのファイル情報を更新
+                            cursor.execute("""
+                                UPDATE files SET file_path = ?, mime_type = ? WHERE id = ?
+                            """, (relative_path, final_mime_type, file_id))
+                            
+                            print(f"[SCAN] Live Photos動画変換完了: {final_filename} -> {converted_path.name}")
+                    
+                    thumbnail_path = THUMBNAILS_DIR / f"{file_id}.jpg"
+                    thumbnail_created = create_video_thumbnail(str(final_file_path), str(thumbnail_path))
+                    
+                    if thumbnail_created:
+                        # サムネイルパスをデータベースに更新
+                        cursor.execute("""
+                            UPDATE files SET thumbnail_path = ? WHERE id = ?
+                        """, (str(thumbnail_path), file_id))
+                        print(f"[SCAN] 動画サムネイル作成完了: {file_id}")
+                    else:
+                        print(f"[SCAN] 動画サムネイル作成失敗: {final_filename}")
+                # 画像ファイルの場合はサムネイル作成をスキップ
                 
                 added_count += 1
                 
@@ -247,22 +407,40 @@ def create_thumbnail(file_path, thumbnail_path, size=(200, 200)):
         return False
 
 def create_video_thumbnail(video_path, thumbnail_path):
-    """動画の最初のフレームからサムネイルを作成"""
+    """動画の最初のフレームからサムネイルを作成（Live Photos対応）"""
     try:
         import subprocess
-        # FFmpegを使用して最初のフレームを取得
-        command = [
-            'ffmpeg',
-            '-i', str(video_path),
-            '-ss', '00:00:01',  # 1秒目のフレーム
-            '-vframes', '1',    # 1フレームのみ
-            '-vf', 'scale=200:200:force_original_aspect_ratio=decrease',
-            '-y',               # 上書き
-            str(thumbnail_path)
-        ]
+        
+        # Live Photos動画かどうかチェック
+        is_live_photo = is_live_photo_video(video_path)
+        
+        if is_live_photo:
+            # Live Photos動画は中間フレームを使用（より良い画質）
+            command = [
+                'ffmpeg',
+                '-i', str(video_path),
+                '-ss', '00:00:00.5',  # 0.5秒目のフレーム（中間あたり）
+                '-vframes', '1',       # 1フレームのみ
+                '-vf', 'scale=300:300:force_original_aspect_ratio=decrease,pad=300:300:(ow-iw)/2:(oh-ih)/2:black',
+                '-q:v', '2',          # 高品質
+                '-y',                 # 上書き
+                str(thumbnail_path)
+            ]
+        else:
+            # 通常の動画は1秒目のフレーム
+            command = [
+                'ffmpeg',
+                '-i', str(video_path),
+                '-ss', '00:00:01',    # 1秒目のフレーム
+                '-vframes', '1',      # 1フレームのみ
+                '-vf', 'scale=200:200:force_original_aspect_ratio=decrease',
+                '-y',                 # 上書き
+                str(thumbnail_path)
+            ]
         
         result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode == 0:
+            print(f"[INFO] {'Live Photos' if is_live_photo else '動画'}サムネイル作成成功: {thumbnail_path}")
             return True
         else:
             print(f"FFmpeg エラー: {result.stderr}")
@@ -281,6 +459,73 @@ def get_file_type(file_path):
     else:
         return 'other'
 
+def is_live_photo_video(file_path):
+    """Live Photos動画かどうかを判定"""
+    try:
+        import ffmpeg
+        probe = ffmpeg.probe(str(file_path))
+        
+        # Live Photos動画の特徴をチェック
+        format_info = probe.get('format', {})
+        streams = probe.get('streams', [])
+        
+        # 動画の長さをチェック（Live Photosは通常1-3秒）
+        duration = float(format_info.get('duration', 0))
+        if duration > 5:  # 5秒以上なら通常の動画
+            return False
+            
+        # メタデータでLive Photosを識別
+        tags = format_info.get('tags', {})
+        live_photo_keys = [
+            'com.apple.quicktime.content.identifier',
+            'com.apple.quicktime.live-photo.auto',
+            'com.apple.quicktime.live-photo.vitality-score'
+        ]
+        
+        for key in live_photo_keys:
+            if key in tags:
+                return True
+                
+        # ファイル名パターンでもチェック（IMG_E で始まる場合など）
+        filename = Path(file_path).name
+        if filename.startswith('IMG_E') and filename.endswith(('.MOV', '.mov')):
+            return True
+            
+        return False
+    except Exception as e:
+        print(f"Live Photos判定エラー: {e}")
+        return False
+
+def convert_live_photo_video(input_path, output_path):
+    """Live Photos動画をブラウザ互換形式に変換"""
+    try:
+        import subprocess
+        
+        # MP4形式に変換してブラウザ互換性を向上
+        command = [
+            'ffmpeg',
+            '-i', str(input_path),
+            '-c:v', 'libx264',      # H.264エンコーダ
+            '-c:a', 'aac',          # AACオーディオ
+            '-movflags', '+faststart',  # ストリーミング最適化
+            '-pix_fmt', 'yuv420p',  # 互換性の高いピクセル形式
+            '-crf', '23',           # 品質設定
+            '-preset', 'medium',    # エンコード速度と品質のバランス
+            '-y',                   # 上書き
+            str(output_path)
+        ]
+        
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"[INFO] Live Photos動画変換成功: {output_path}")
+            return True
+        else:
+            print(f"動画変換エラー: {result.stderr}")
+            return False
+    except Exception as e:
+        print(f"Live Photos動画変換エラー: {e}")
+        return False
+
 def get_file_hash(file_path):
     """ファイルのSHA256ハッシュを計算"""
     hash_sha256 = hashlib.sha256()
@@ -290,7 +535,7 @@ def get_file_hash(file_path):
     return hash_sha256.hexdigest()
 
 def convert_heic_to_jpeg(heic_path, jpeg_path, quality=90):
-    """HEICファイルをJPEGに変換"""
+    """HEICファイルをJPEGに変換し、元のHEICファイルを削除"""
     try:
         with Image.open(heic_path) as img:
             # RGBモードに変換（JPEG用）
@@ -299,7 +544,12 @@ def convert_heic_to_jpeg(heic_path, jpeg_path, quality=90):
             
             # JPEGで保存
             img.save(jpeg_path, 'JPEG', quality=quality, optimize=True)
-            return True
+            
+        # 変換成功後、元のHEICファイルを削除
+        import os
+        os.remove(heic_path)
+        print(f"[INFO] HEIC変換完了、元ファイル削除: {heic_path} -> {jpeg_path}")
+        return True
     except Exception as e:
         print(f"HEIC変換エラー: {e}")
         return False
@@ -414,8 +664,11 @@ def upload_file():
             # 一時ファイル保存
             file.save(temp_file_path)
             
-            # 撮影日時を取得
-            taken_date = get_image_taken_date(str(temp_file_path))
+            # ファイルタイプを判定
+            file_type = 'image' if file_ext in {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.heic', '.heif'} else 'video'
+            
+            # 撮影日時を取得（ファイルタイプに応じて適切な関数を使用）
+            taken_date = get_file_taken_date(str(temp_file_path), file_type)
             print(f"[UPLOAD] Detected taken date: {taken_date}")
             
             # 適切なフォルダを確保
@@ -482,6 +735,23 @@ def upload_file():
             # サムネイル作成（動画の場合のみ - 画像は元画像を使用）
             thumbnail_path = None
             if file_type == 'video':
+                # Live Photos動画の場合は互換形式に変換
+                if is_live_photo_video(str(final_file_path)):
+                    print(f"[UPLOAD] Live Photos動画を検出: {original_name}")
+                    
+                    # MP4に変換したファイルパス
+                    converted_path = final_file_path.with_suffix('.mp4')
+                    
+                    if convert_live_photo_video(str(final_file_path), str(converted_path)):
+                        # 変換成功時は元ファイルを削除し、パスを更新
+                        import os
+                        os.remove(str(final_file_path))
+                        final_file_path = converted_path
+                        relative_path = str(final_file_path.relative_to(EXTERNAL_STORAGE_DIR))
+                        mime_type = 'video/mp4'
+                        
+                        print(f"[UPLOAD] Live Photos動画変換完了: {original_name} -> {converted_path.name}")
+                
                 thumbnail_filename = f"thumb_{file_id}.jpg"
                 thumbnail_path = THUMBNAILS_DIR / thumbnail_filename
                 if create_video_thumbnail(final_file_path, thumbnail_path):
@@ -530,14 +800,20 @@ def upload_file():
 def scan_storage():
     """外部ストレージをスキャンしてデータベースに登録"""
     try:
-        scanned_count, added_count = scan_external_storage()
+        force_rescan = request.json.get('force', False) if request.is_json else False
+        max_files = request.json.get('max_files', None) if request.is_json else None
+        scanned_count, added_count = scan_external_storage(force_rescan=force_rescan, max_files=max_files)
         return jsonify({
+            "success": True,
             "message": f"スキャン完了: {scanned_count}件スキャン, {added_count}件新規追加",
             "scanned": scanned_count,
             "added": added_count
         })
     except Exception as e:
-        return jsonify({"error": f"スキャンエラー: {str(e)}"}), 500
+        return jsonify({
+            "success": False,
+            "error": f"スキャンエラー: {str(e)}"
+        }), 500
 
 @app.route('/cleanup', methods=['POST'])
 def cleanup_database():
@@ -572,15 +848,26 @@ def cleanup_database():
 @app.route('/files', methods=['GET'])
 @login_required
 def list_files():
-    """ファイル一覧取得"""
+    """ファイル一覧取得（ページネーション対応）"""
     conn = sqlite3.connect(DATABASE_PATH)
     cursor = conn.cursor()
     
+    # ページネーションパラメータ
+    page = request.args.get('page', 1, type=int)
+    per_page = request.args.get('per_page', 50, type=int)  # デフォルト50件
+    offset = (page - 1) * per_page
+    
+    # 総件数を取得
+    cursor.execute("SELECT COUNT(*) FROM files")
+    total_count = cursor.fetchone()[0]
+    
+    # ページ分の데이터を取得
     cursor.execute("""
-        SELECT id, original_name, filename, file_type, file_size, created_at
+        SELECT id, original_name, filename, file_type, file_size, created_at, taken_date
         FROM files
-        ORDER BY created_at DESC
-    """)
+        ORDER BY taken_date DESC, created_at DESC
+        LIMIT ? OFFSET ?
+    """, (per_page, offset))
     
     files = []
     for row in cursor.fetchall():
@@ -590,17 +877,33 @@ def list_files():
             "filename": row[2],
             "file_type": row[3],
             "file_size": row[4],
-            "created_at": row[5]
+            "created_at": row[5],
+            "taken_date": row[6]
         })
+    
+    # ページネーション情報
+    total_pages = (total_count + per_page - 1) // per_page
+    has_next = page < total_pages
+    has_prev = page > 1
     
     # デバッグ用ログ
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
     user_agent = request.headers.get('User-Agent', 'Unknown')
-    print(f"[DEBUG] /files request from {client_ip}, returning {len(files)} files: {[f['id'] for f in files]}")
+    print(f"[DEBUG] /files request from {client_ip}, page {page}, returning {len(files)} files")
     
     conn.close()
     
-    response = jsonify({"files": files})
+    response = jsonify({
+        "files": files,
+        "pagination": {
+            "page": page,
+            "per_page": per_page,
+            "total_count": total_count,
+            "total_pages": total_pages,
+            "has_next": has_next,
+            "has_prev": has_prev
+        }
+    })
     # キャッシュを無効にする
     response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
     response.headers['Pragma'] = 'no-cache'
@@ -608,7 +911,6 @@ def list_files():
     return response
 
 @app.route('/files/<file_id>', methods=['GET'])
-@login_required
 def get_file(file_id):
     """ファイル取得"""
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
@@ -649,7 +951,6 @@ def get_file(file_id):
     return response
 
 @app.route('/thumbnails/<file_id>', methods=['GET'])
-@login_required
 def get_thumbnail(file_id):
     """サムネイル取得（画像の場合は元画像、動画の場合はサムネイル）"""
     client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
@@ -1443,14 +1744,17 @@ if __name__ == '__main__':
     init_db()
     
     # 外部ストレージの自動スキャン（環境変数で制御）
-    auto_scan = os.environ.get('AUTO_SCAN_STORAGE', 'true').lower() == 'true'
+    auto_scan = os.environ.get('AUTO_SCAN_STORAGE', 'false').lower() == 'true'  # デフォルトをfalseに変更
     if auto_scan:
         print("[STARTUP] Auto-scanning external storage...")
         try:
-            scanned_count, added_count = scan_external_storage()
+            # テスト用：最大100ファイルまで処理
+            scanned_count, added_count = scan_external_storage(max_files=100)
             print(f"[STARTUP] Auto-scan completed: {scanned_count} scanned, {added_count} added")
         except Exception as e:
             print(f"[STARTUP] Auto-scan failed: {e}")
+    else:
+        print("[STARTUP] Auto-scan disabled. Use /scan endpoint to scan manually.")
     
     # デバッグ: 起動時にデータベースの内容を確認
     conn = sqlite3.connect(DATABASE_PATH)
@@ -1473,4 +1777,4 @@ if __name__ == '__main__':
     print("ローカルアクセス: http://127.0.0.1:5000")
     print("LAN内アクセス: http://172.26.155.97:5000")
     print("=" * 50)
-    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
